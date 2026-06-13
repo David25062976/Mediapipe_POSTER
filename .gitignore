@@ -1,0 +1,41 @@
+# Data and checkpoints
+data/
+checkpoint/
+checkpoints/
+
+# Unrelated research datasets / folders
+FER_datasets/
+MU3D/
+RDD/
+YT_PD_videos/
+Manually_Annotated_file_lists/
+out_videos_label/
+Facial Emotion Recognition Related Papers/
+20260*報告/
+
+# Documents / slides / reports
+*.pptx
+*.docx
+*.pdf
+*.xlsx
+*.csv
+
+# Weights / landmark caches
+*.pt
+*.pth
+
+# Images
+*.jpg
+*.jpeg
+*.png
+
+# Logs
+*.log
+*.txt
+
+# Python
+__pycache__/
+*.pyc
+
+# Office temp files
+~$*

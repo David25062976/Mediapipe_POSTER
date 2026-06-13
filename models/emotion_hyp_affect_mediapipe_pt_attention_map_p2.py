@@ -1,0 +1,605 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
+import threading
+
+from .hyp_crossvit_affect_attention_map_p2 import *
+from .mobilefacenet import MobileFaceNet
+from .ir50 import Backbone
+
+
+def load_pretrained_weights(model, checkpoint):
+    import collections
+    
+    # 處理不同的 Checkpoint 格式
+    if 'state_dict' in checkpoint:
+        state_dict = checkpoint['state_dict']
+    elif 'model_state_dict' in checkpoint:
+        state_dict = checkpoint['model_state_dict']
+    else:
+        state_dict = checkpoint
+        
+    model_dict = model.state_dict()
+    new_state_dict = collections.OrderedDict()
+    
+    matched_layers = []
+    discarded_layers = []
+    
+    # 1. 檢查 Checkpoint 中的權重是否能載入目前的模型
+    for k, v in state_dict.items():
+        # 移除可能由 nn.DataParallel 帶入的 'module.' 前綴
+        if k.startswith('module.'):
+            k = k[7:]
+            
+        if k in model_dict:
+            # 檢查 shape (維度) 是否一致
+            if model_dict[k].size() == v.size():
+                new_state_dict[k] = v
+                matched_layers.append(k)
+            else:
+                discarded_layers.append(f"{k} (Shape 衝突: Checkpoint {list(v.size())} vs 模型 {list(model_dict[k].size())})")
+        else:
+            discarded_layers.append(f"{k} (目前模型中不存在此層)")
+            
+    # 2. 反向檢查：模型中有哪些層是 Checkpoint 沒給的（遺失的權重）
+    missing_layers = [k for k in model_dict.keys() if k not in matched_layers]
+
+    # 將可用的權重更新到 model_dict 並載入
+    model_dict.update(new_state_dict)
+    # 使用 strict=False 允許不完全匹配的載入
+    model.load_state_dict(model_dict, strict=False)
+    
+    # 3. 印出詳細的總結報告
+    print("\n" + "=" * 60)
+    print("                 載入權重診斷報告 (Weight Loading Report)")
+    print("=" * 60)
+    
+    # --- 成功部分 ---
+    print(f"✅ 成功載入層數 (Matched Layers): {len(matched_layers)} layers")
+    # (如果不想看到滿滿的成功層名，可以把下面這行註解掉)
+    # for layer in matched_layers:
+    #     print(f"    - {layer}")
+        
+    # --- 丟棄部分 ---
+    print(f"\n❌ 丟棄/無法載入的 Checkpoint 權重: {len(discarded_layers)} layers")
+    if len(discarded_layers) > 0:
+        for layer in discarded_layers:
+            print(f"    - {layer}")
+            
+    # --- 缺失部分 ---
+    print(f"\n⚠️ 模型中未獲得預訓練權重 (將隨機初始化): {len(missing_layers)} layers")
+    if len(missing_layers) > 0:
+        for layer in missing_layers:
+            print(f"    - {layer}")
+            
+    print("=" * 60 + "\n")
+    
+    return model
+
+
+class PatchFeatureEncoder49_14(nn.Module):
+    def __init__(self, out_dim=1024):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=3), # [3, 14, 14] -> [64, 12, 12]
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.MaxPool2d(2), # [64, 12, 12] -> [64, 6, 6]
+            
+            nn.Conv2d(64, 128, kernel_size=3), # [64, 6, 6] -> [128, 4, 4]
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+
+            nn.Conv2d(128, 256, kernel_size=3), # [128, 4, 4] -> [256, 2, 2]
+            nn.BatchNorm2d(256),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((1, 1)), # [256, 2, 2] -> [256, 1, 1]
+        )
+
+        self.fuse_projection = nn.Sequential(
+            nn.Linear(256, 512), # 256 -> 512
+            nn.LayerNorm(512), # 增加穩定性
+            nn.ReLU(),
+            nn.Linear(512, out_dim) # 512 -> 1024
+        )
+
+    def forward(self, x):
+        # x shape: [B*49, 3, 28, 28]
+        feat = self.conv(x)
+        feat = feat.view(feat.size(0), -1)
+        return self.fuse_projection(feat) # [B*49, 1024]
+
+class PatchFeatureEncoder49_24(nn.Module):
+    def __init__(self, out_dim=1024):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, padding=1),    # [3, 24, 24] -> [32, 24, 24]
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            nn.MaxPool2d(2),                               # [32, 24, 24] -> [32, 12, 12]
+
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),    # [32, 12, 12] -> [64, 12, 12]
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.MaxPool2d(2),                       # [64, 12, 12] -> [64, 6, 6]
+            
+            nn.Conv2d(64, 128, kernel_size=3),     # [64, 6, 6] -> [128, 4, 4]
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+
+            nn.Conv2d(128, 256, kernel_size=3),    # [128, 4, 4] -> [256, 2, 2]
+            nn.BatchNorm2d(256),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((1, 1)),          # [256, 2, 2] -> [256, 1, 1]
+        )
+
+        self.fuse_projection = nn.Sequential(
+            nn.Linear(256, 512), # 256 -> 512
+            nn.LayerNorm(512), # 增加穩定性
+            nn.ReLU(),
+            nn.Linear(512, out_dim) # 512 -> 1024
+        )
+
+    def forward(self, x):
+        # x shape: [B*49, 3, 28, 28]
+        feat = self.conv(x)
+        feat = feat.view(feat.size(0), -1)
+        return self.fuse_projection(feat) # [B*49, 1024]
+
+class PatchFeatureEncoder196_14(nn.Module):
+    def __init__(self, out_dim=1024):
+        super().__init__()
+        # 針對 14x14 Patch 的輕量化 CNN
+        self.conv = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=3),      # [3, 14, 14] -> [64, 12, 12]
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.MaxPool2d(2),                     # [64, 12, 12] -> [64, 6, 6]
+            
+            nn.Conv2d(64, 128, kernel_size=3),     # [64, 6, 6] -> [128, 4, 4]
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+
+            nn.Conv2d(128, 256, kernel_size=3),    # [128, 4, 4] -> [256, 2, 2]
+            nn.BatchNorm2d(256),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((1, 1)),          # [256, 2, 2] -> [256, 1, 1]
+        )
+
+        # 聚合層：將 4 個特徵點的向量 (256*4) 合併為 1 個 1024 維特徵
+        self.fuse_projection = nn.Sequential(
+            nn.Linear(256 * 4, out_dim),           # 1024 -> 1024
+            nn.LayerNorm(out_dim),                 # 增加穩定性
+            nn.ReLU(),
+            nn.Linear(out_dim, out_dim)
+        )
+
+    def forward(self, x):
+        # 輸入 x shape: [B * 196, 3, 14, 14]
+        N = x.size(0)
+        
+        # 1. 卷積特徵提取
+        feat = self.conv(x)                        # [B * 196, 256, 1, 1]
+        feat = feat.view(N, -1)                    # [B * 196, 256]
+        
+        # 2. 空間聚合 (196 點 -> 49 點)
+        # 將每 4 個點一組進行拼接：[B * 49, 4 * 256]
+        feat = feat.view(-1, 4 * 256)              # [B * 49, 1024]
+        
+        # 3. 投影到最終特徵空間
+        return self.fuse_projection(feat)          # [B * 49, 1024]
+
+class PatchFeatureEncoder196_24(nn.Module):
+    def __init__(self, out_dim=1024):
+        super().__init__()
+        # 針對 28x28 Patch 的 CNN 架構
+        self.conv = nn.Sequential(
+            nn.Conv2d(3, 32, kernel_size=3, padding=1),    # [3, 24, 24] -> [32, 24, 24]
+            nn.BatchNorm2d(32),
+            nn.ReLU(),
+            nn.MaxPool2d(2),                               # [32, 24, 24] -> [32, 12, 12]
+
+            nn.Conv2d(32, 64, kernel_size=3, padding=1),    # [32, 12, 12] -> [64, 12, 12]
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.MaxPool2d(2),                       # [64, 12, 12] -> [64, 6, 6]
+            
+            nn.Conv2d(64, 128, kernel_size=3),     # [64, 6, 6] -> [128, 4, 4]
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+
+            nn.Conv2d(128, 256, kernel_size=3),    # [128, 4, 4] -> [256, 2, 2]
+            nn.BatchNorm2d(256),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((1, 1)),          # [256, 2, 2] -> [256, 1, 1]
+        )
+
+        # 聚合層：將 4 個特徵點的向量 (256*4) 合併為 1 個 1024 維特徵
+        self.fuse_projection = nn.Sequential(
+            nn.Linear(256 * 4, out_dim),                   # 1024 -> 1024
+            nn.LayerNorm(out_dim),                         # 增加穩定性
+            nn.ReLU(),
+            nn.Linear(out_dim, out_dim)
+        )
+
+    def forward(self, x):
+        # 輸入 x shape: [B * 196, 3, 28, 28]
+        N = x.size(0)
+        
+        # 1. 卷積特徵提取
+        feat = self.conv(x)                        # [B * 196, 256, 1, 1]
+        feat = feat.view(N, -1)                    # [B * 196, 256]
+        
+        # 2. 空間聚合 (196 點 -> 49 點)
+        feat = feat.view(-1, 4 * 256)              # [B * 49, 1024]
+        
+        # 3. 投影到最終特徵空間
+        return self.fuse_projection(feat)          # [B * 49, 1024]
+
+class PatchFeatureEncoder478_14(nn.Module):
+    def __init__(self, out_dim=1024):
+        super().__init__()
+        # 針對 14x14 Patch 的輕量化 CNN
+        self.conv = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=3),      # [3, 14, 14] -> [64, 12, 12]
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.MaxPool2d(2),                      # [64, 12, 12] -> [64, 6, 6]
+            
+            nn.Conv2d(64, 128, kernel_size=3),    # [64, 6, 6] -> [128, 4, 4]
+            nn.BatchNorm2d(128),
+            nn.ReLU(),
+
+            nn.Conv2d(128, 256, kernel_size=3),   # [128, 4, 4] -> [256, 2, 2]
+            nn.BatchNorm2d(256),
+            nn.ReLU(),
+            nn.AdaptiveAvgPool2d((1, 1)),         # [256, 2, 2] -> [256, 1, 1]
+        )
+
+        # ★ 新增：自適應池化層，用來將 478 個特徵點壓縮成 49 個
+        self.token_pool = nn.AdaptiveAvgPool1d(49)
+
+        # 投影層：256 維 -> 1024 維
+        self.fuse_projection = nn.Sequential(
+            nn.Linear(256, 512),
+            nn.LayerNorm(512),
+            nn.ReLU(),
+            nn.Linear(512, out_dim)
+        )
+
+    def forward(self, x, num_points):
+        # 輸入 x shape: [B * 478, 3, 14, 14]
+        # 反推 Batch Size (B)
+        B = x.size(0) // num_points
+        
+        # 1. 卷積特徵提取
+        feat = self.conv(x)                        # [B * 478, 256, 1, 1]
+        feat = feat.view(B, num_points, 256)              # 展開為 [B, 478, 256]
+        
+        # 2. 空間/序列聚合 (478 點 -> 49 點)
+        # AdaptiveAvgPool1d 期望的輸入維度是 [Batch, Channel, Length]
+        feat = feat.transpose(1, 2)                # [B, 256, 478]
+        feat = self.token_pool(feat)               # [B, 256, 49]
+        
+        # 轉回 [B, 49, 256] 並打平
+        feat = feat.transpose(1, 2).contiguous()   # [B, 49, 256]
+        feat = feat.view(-1, 256)                  # [B * 49, 256]
+        
+        # 3. 投影到最終特徵空間
+        return self.fuse_projection(feat)          # [B * 49, 1024]
+
+class MediaPipeFeatureExtractor(nn.Module):
+    def __init__(self, output_dim=1024, points=196, patch_size=24):
+        super().__init__()
+        self.points = points
+        self.patch_size = patch_size
+        self.output_dim = output_dim
+        
+        if self.points == 478:
+            self.target_indices = list(range(478))
+        elif self.points == 196:
+            self.target_indices = [
+                # 1-2: 中軸線與口鼻核心 (8 pts)
+                0, 4, 6, 8,       # 鼻樑與鼻尖
+                17, 18, 19, 152,  # 人中與下巴中心
+
+                # 3-10: 左眼區域 (32 pts)
+                33, 133, 144, 145,   153, 154, 155, 157, 
+                158, 159, 160, 161,   163, 173, 246, 7,
+                37, 39, 40, 43,       193, 195, 196, 198,
+                199, 201, 204, 206,   164, 165, 111, 112,
+
+                # 11-18: 右眼區域 (32 pts)
+                263, 362, 373, 374,   380, 381, 382, 384,
+                385, 386, 387, 388,   390, 398, 466, 249,
+                267, 269, 270, 273,   417, 419, 420, 421,
+                424, 426, 430, 432,   391, 395, 340, 341,
+
+                # 19-24: 左眉毛區域 (24 pts)
+                70, 105, 107, 68,     69, 101, 47, 53,
+                65, 59, 61, 51,       21, 22, 24, 25,
+                28, 29, 32, 97,       87, 118, 120, 123,
+
+                # 25-30: 右眉毛區域 (24 pts)
+                300, 334, 336, 298,   299, 330, 277, 283,
+                295, 289, 291, 281,   251, 252, 254, 255,
+                258, 259, 262, 326,   317, 347, 349, 352,
+
+                # 31-39: 左臉頰與左嘴角 (36 pts)
+                146, 91, 181, 182,    185, 186, 187, 188,
+                190, 226, 227, 228,   230, 232, 244, 84,
+                82, 170, 171, 177,    215, 217, 220, 221,
+                223, 225, 136, 138,   139, 142, 143, 127,
+                130, 131, 124, 110,   # 110 是補充點位
+
+                # 40-48: 右臉頰與右嘴角 (36 pts)
+                375, 321, 405, 406,   409, 410, 411, 412,
+                414, 446, 447, 448,   450, 452, 464, 314,
+                312, 395, 396, 401,   435, 437, 440, 441,
+                443, 445, 365, 367,   368, 371, 372, 356,
+                359, 360, 353, 467,
+
+                # 49: 剩餘邊緣點位聚合 (4 pts)
+                467, 247, 464, 252    # 確保最後一組湊滿 4 個
+            ]
+        else :
+            # 49個目標點位
+            self.target_indices = [0, 4, 17, 33, 35, 37, 39, 40, 61, 63, 66, 84, 91, 133, 144, 153, 158, 160, 181, 221, 223, 225, 228, 230, 232, 245, 263, 265, 267, 269, 270, 291, 293, 296, 314, 321, 362, 373, 380, 385, 387, 405, 441, 443, 445, 448, 450, 452, 465]
+        
+        self.symmetry_map = {
+            3: 248, 7: 249, 8: 285, 20: 250, 21: 251, 22: 252, 23: 253, 24: 254,
+            25: 255, 26: 256, 27: 257, 28: 258, 29: 259, 30: 260, 31: 261, 32: 262,
+            33: 263, 34: 264, 35: 265, 36: 266, 37: 267, 38: 268, 39: 269, 40: 270,
+            41: 271, 42: 272, 43: 273, 44: 274, 45: 275, 46: 276, 47: 277, 48: 278,
+            49: 279, 50: 280, 51: 281, 52: 282, 53: 283, 54: 284, 55: 285, 56: 286,
+            57: 287, 58: 288, 59: 289, 60: 290, 61: 291, 62: 308, 63: 293, 64: 294,
+            65: 295, 66: 296, 67: 297, 68: 298, 69: 299, 70: 300, 71: 301, 72: 302,
+            73: 303, 74: 304, 75: 305, 76: 306, 77: 307, 78: 308, 79: 309, 80: 318,
+            81: 311, 82: 312, 83: 313, 84: 314, 85: 315, 86: 316, 87: 317, 88: 318,
+            89: 319, 90: 320, 91: 321, 92: 322, 93: 323, 95: 324, 96: 324, 97: 326,
+            98: 327, 99: 328, 100: 329, 101: 330, 102: 331, 103: 332, 104: 333, 105: 334,
+            106: 335, 107: 336, 108: 337, 109: 338, 110: 339, 111: 340, 112: 341, 113: 342,
+            114: 343, 115: 344, 116: 345, 117: 346, 118: 347, 119: 348, 120: 349, 121: 350,
+            122: 351, 123: 352, 124: 353, 125: 354, 126: 355, 127: 356, 128: 357, 129: 358,
+            130: 359, 131: 360, 132: 361, 133: 362, 134: 363, 135: 364, 136: 365, 137: 366,
+            138: 367, 139: 368, 140: 369, 141: 370, 142: 371, 143: 372, 144: 373, 145: 477,
+            146: 375, 147: 376, 148: 377, 149: 378, 150: 379, 153: 380, 154: 381, 155: 382,
+            156: 383, 157: 384, 158: 385, 159: 386, 160: 387, 161: 466, 162: 389, 163: 390,
+            165: 391, 166: 392, 167: 393, 169: 394, 170: 395, 171: 396, 172: 397, 173: 398,
+            174: 399, 176: 400, 177: 401, 178: 402, 179: 403, 180: 404, 181: 405, 182: 406,
+            183: 415, 184: 407, 185: 408, 186: 410, 187: 411, 188: 412, 189: 413, 190: 414,
+            191: 324, 192: 416, 193: 417, 194: 418, 196: 419, 198: 420, 201: 421, 202: 422,
+            203: 423, 204: 424, 205: 425, 206: 426, 207: 427, 208: 428, 209: 429, 210: 430,
+            211: 431, 212: 432, 213: 433, 214: 434, 215: 435, 216: 436, 217: 437, 218: 438,
+            219: 439, 220: 440, 221: 441, 222: 442, 223: 443, 224: 444, 225: 445, 226: 446,
+            227: 447, 228: 448, 229: 449, 230: 450, 231: 451, 232: 452, 233: 453, 234: 454,
+            235: 455, 236: 456, 237: 457, 238: 458, 239: 459, 240: 460, 241: 461, 242: 462,
+            243: 463, 244: 464, 245: 465, 246: 249, 247: 467, 468: 473, 469: 476, 470: 475,
+            471: 474, 472: 477,
+        }
+        # 建立反向映射
+        self.reverse_map = {v: k for k, v in self.symmetry_map.items()}
+
+        # 建立模型 Buffer 供 GPU 快速查找
+        pair_indices_list = []
+        has_pair_list = []
+        for idx in self.target_indices:
+            pair = self.symmetry_map.get(idx) or self.reverse_map.get(idx)
+            if pair is not None:
+                pair_indices_list.append(pair)
+                has_pair_list.append(True)
+            else:
+                pair_indices_list.append(idx)
+                has_pair_list.append(False)
+
+        self.register_buffer('target_indices_tensor', torch.tensor(self.target_indices, dtype=torch.long))
+        self.register_buffer('pair_indices_tensor', torch.tensor(pair_indices_list, dtype=torch.long))
+        self.register_buffer('has_pair_tensor', torch.tensor(has_pair_list, dtype=torch.bool))
+
+        # Patch CNN 卷積特徵提取器
+        if self.points == 478:
+            if self.patch_size == 14:
+                self.patch_cnn = PatchFeatureEncoder478_14(out_dim=output_dim)
+            else:
+                # 若你有 24 的需求，也可以寫一個 PatchFeatureEncoder478_24
+                raise NotImplementedError("PatchFeatureEncoder478_24 is not implemented yet.")
+        elif self.points == 49:
+            if self.patch_size == 14:
+                self.patch_cnn = PatchFeatureEncoder49_14(out_dim=output_dim)
+            else:
+                self.patch_cnn = PatchFeatureEncoder49_24(out_dim=output_dim)
+        else:
+            if self.patch_size == 14:
+                self.patch_cnn = PatchFeatureEncoder196_14(out_dim=output_dim)
+            else:
+                self.patch_cnn = PatchFeatureEncoder196_24(out_dim=output_dim)
+
+
+    def get_valid_landmarks(self, coords_478, img_w=224, img_h=224, active_indices=None):
+        """完全使用 Tensor 平行運算計算遮蔽與越界"""
+        z_threshold = 0.75
+        
+        # 根據 active_indices 動態選擇要保留的點
+        if active_indices is not None:
+            t_idx = self.target_indices_tensor[active_indices]
+            p_idx = self.pair_indices_tensor[active_indices]
+            h_pair = self.has_pair_tensor[active_indices]
+        else:
+            t_idx = self.target_indices_tensor
+            p_idx = self.pair_indices_tensor
+            h_pair = self.has_pair_tensor
+
+        coords_target = coords_478[:, t_idx, :]
+        pair_coords = coords_478[:, p_idx, :]
+
+        z_diff = coords_target[:, :, 2] - pair_coords[:, :, 2]
+        is_occluded = (z_diff > z_threshold) & h_pair
+
+        x = coords_target[:, :, 0]
+        y = coords_target[:, :, 1]
+        out_of_bounds = (x <= 0) | (x >= img_w) | (y <= 0) | (y >= img_h)
+
+        replace_mask = (out_of_bounds | is_occluded) & h_pair
+        
+        final_x = torch.where(replace_mask, pair_coords[:, :, 0], coords_target[:, :, 0])
+        final_y = torch.where(replace_mask, pair_coords[:, :, 1], coords_target[:, :, 1])
+        final_coords = torch.stack([final_x, final_y], dim=-1)
+        
+        return final_coords, replace_mask
+
+
+    def extract_patches(self, x, final_coords, flip_flags):
+        """從 Tensor 裁切 Patch，並使用 GPU 並行翻轉 (展平最佳化版)"""
+        B, C, H, W = x.shape
+        num_pts = final_coords.shape[1] 
+        
+        # 1. 歸一化座標到 [-1, 1] 供 grid_sample 使用
+        norm_coords = torch.zeros((B, num_pts, 2), device=x.device)
+        norm_coords[:, :, 0] = (final_coords[:, :, 0] / (W - 1)) * 2 - 1
+        norm_coords[:, :, 1] = (final_coords[:, :, 1] / (H - 1)) * 2 - 1
+        
+        grid_size = self.patch_size
+        rel_grid = torch.linspace(-1, 1, grid_size, device=x.device)
+        yy, xx = torch.meshgrid(rel_grid, rel_grid, indexing='ij')
+        patch_grid = torch.stack([xx, yy], dim=-1).view(1, 1, grid_size, grid_size, 2)
+        
+        scale = torch.tensor([grid_size/W, grid_size/H], device=x.device).view(1, 1, 1, 1, 2)
+        
+        final_grid = norm_coords.view(B, num_pts, 1, 1, 2) + patch_grid * scale
+        final_grid = final_grid.view(B * num_pts, grid_size, grid_size, 2)
+        
+        x_expanded = x.unsqueeze(1).expand(-1, num_pts, -1, -1, -1).reshape(B * num_pts, C, H, W)
+        
+        # 2. 統一裁切 (此時 patches shape 為 [B*num_pts, C, grid_size, grid_size])
+        patches = F.grid_sample(x_expanded, final_grid, align_corners=True)
+        
+        # 3. 全張量並行翻轉
+        flipped_patches = torch.flip(patches, dims=[-1])
+        
+        # 4. 【關鍵修正】把遮罩直接展平，形狀變為 [B*num_pts, 1, 1, 1] 以完美對齊 patches
+        flip_mask = flip_flags.view(-1, 1, 1, 1) 
+        
+        # 5. 根據遮蔽判定決定是否取用翻轉後的 patch
+        patches = torch.where(flip_mask, flipped_patches, patches)
+        
+        # 直接回傳，不需要再 reshape 回去了！
+        return patches
+
+    def forward(self, x, coords_478, active_indices=None):
+        final_coords, flip_flags = self.get_valid_landmarks(coords_478, x.shape[3], x.shape[2], active_indices)
+        patches = self.extract_patches(x, final_coords, flip_flags)
+        
+        num_points = final_coords.shape[1]
+        
+        # 將 num_points 傳給 Patch Encoder
+        if self.points == 478:
+            features = self.patch_cnn(patches, num_points)
+        else:
+            features = self.patch_cnn(patches)
+            
+        return features.view(x.shape[0], 49, self.output_dim)
+
+
+class SE_block(nn.Module):
+    def __init__(self, input_dim: int):
+        super().__init__()
+        self.linear1 = torch.nn.Linear(input_dim, input_dim)
+        self.relu = nn.ReLU()
+        self.linear2 = torch.nn.Linear(input_dim, input_dim)
+        self.sigmod = nn.Sigmoid()
+
+    def forward(self, x):
+        x1 = self.linear1(x)
+        x1 = self.relu(x1)
+        x1 = self.linear2(x1)
+        x1 = self.sigmod(x1)
+        x = x * x1
+        return x
+
+
+class ClassificationHead(nn.Module):
+    def __init__(self, input_dim: int, target_dim: int):
+        super().__init__()
+        self.linear = torch.nn.Linear(input_dim, target_dim)
+
+    def forward(self, x):
+        x = x.view(x.size(0), -1)
+        y_hat = self.linear(x)
+        return y_hat
+    
+
+# --- 修改後的 pyramid_trans_expr ---
+class pyramid_trans_expr(nn.Module):
+    def __init__(self, img_size=224, num_classes=7, type="large", freeze=False, mediapipe_points=196, mediapipe_patch_size=24):
+        super().__init__()
+        depth = 8
+        if type == "small":
+            depth = 4
+        if type == "base":
+            depth = 6
+        if type == "large":
+            depth = 8
+
+        self.img_size = img_size
+        self.num_classes = num_classes
+
+        # 替換為新的提取器
+        self.face_landback = MediaPipeFeatureExtractor(output_dim=1024, points=mediapipe_points, patch_size=mediapipe_patch_size)
+        
+        self.ir_back = Backbone(50, 0.0, 'ir')
+        ir_checkpoint = torch.load('./models/pretrain/ir50.pth', map_location=lambda storage, loc: storage)
+        self.ir_back = load_pretrained_weights(self.ir_back, ir_checkpoint)
+        print("ir_back weight loaded")
+
+        if freeze:
+            for param in self.ir_back.parameters():
+                param.requires_grad = False
+        else:
+            for param in self.ir_back.parameters():
+                param.requires_grad = True
+
+        # 因為 face_landback 現在直接輸出 [B, 49, 1024]
+        # ir_back 輸出也是 [B, 49, 1024]，所以不需要 ir_layer 降維了
+
+        self.pyramid_fuse = HyVisionTransformer(in_chans=mediapipe_points, q_chanel=mediapipe_points, embed_dim=1024,
+                                             depth=depth, num_heads=8, mlp_ratio=2.,
+                                             drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1)
+
+        self.se_block = SE_block(input_dim=1024)
+        self.head = ClassificationHead(input_dim=1024, target_dim=self.num_classes)
+
+    def forward(self, x, coords_478, return_attention=False, active_indices=None):
+        x_face = self.face_landback(x, coords_478, active_indices=active_indices) # 往下傳遞
+
+        # 2. 取得 IR 特徵 [B, 49, 1024]
+        x_ir = self.ir_back(x)
+
+        # ==========================================
+        # ★ 動態插值升維 x_ir 以對齊 x_face 的長度
+        # ==========================================
+        current_pts = x_face.size(1) # 取得目前的點數 N
+        
+        # 轉換為 [Batch, Channel, Length] 以符合 interpolate 格式
+        x_ir = x_ir.transpose(1, 2)  # [B, 1024, 49]
+        # 沿著序列長度進行一維線性插值
+        x_ir = F.interpolate(x_ir, size=current_pts, mode='linear', align_corners=False)
+        # 轉回 [Batch, Length, Channel]
+        x_ir = x_ir.transpose(1, 2)  # [B, current_pts, 1024]
+        # ==========================================
+
+        if return_attention:
+            y_hat, attn_maps = self.pyramid_fuse(x_ir, x_face, return_attention=True)
+        else:
+            y_hat = self.pyramid_fuse(x_ir, x_face)
+        
+        y_hat = self.se_block(y_hat)
+        y_feat = y_hat
+        out = self.head(y_hat)
+
+        if return_attention:
+            return out, y_feat, attn_maps
+        return out, y_feat
